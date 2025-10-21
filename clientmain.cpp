@@ -6,6 +6,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <fcntl.h>
 #include "calcLib.h"
 
 #define MAXBUF 1024
@@ -25,7 +27,6 @@ bool parseHostPort(const std::string &input, std::string &host, std::string &por
 {
   if (input.empty())
     return false;
-
   if (input[0] == '[')
   { // IPv6: [address]:port
     auto closeBracket = input.find(']');
@@ -87,10 +88,8 @@ int main(int argc, char *argv[])
   }
 
   std::cout << "Host " << host << ", and port " << port << "." << std::endl;
+  initCalcLib();
 
-  initCalcLib(); // required by assignment
-
-  // Resolve host
   struct addrinfo hints{}, *res;
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -108,24 +107,59 @@ int main(int argc, char *argv[])
     sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (sockfd < 0)
       continue;
-    if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0)
+
+    // Set non-blocking for timeout
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+    int conn = connect(sockfd, p->ai_addr, p->ai_addrlen);
+    if (conn < 0 && errno != EINPROGRESS)
     {
-      char addr[INET6_ADDRSTRLEN];
-      void *addrPtr = (p->ai_family == AF_INET)
-                          ? (void *)&((struct sockaddr_in *)p->ai_addr)->sin_addr
-                          : (void *)&((struct sockaddr_in6 *)p->ai_addr)->sin6_addr;
-      inet_ntop(p->ai_family, addrPtr, addr, sizeof(addr));
-      LOG("Connected to " << addr << ":" << port);
-      break;
+      close(sockfd);
+      sockfd = -1;
+      continue;
     }
-    close(sockfd);
-    sockfd = -1;
+
+    fd_set wfds;
+    struct timeval tv;
+    FD_ZERO(&wfds);
+    FD_SET(sockfd, &wfds);
+    tv.tv_sec = TIMEOUT_SEC;
+    tv.tv_usec = 0;
+
+    if (select(sockfd + 1, nullptr, &wfds, nullptr, &tv) > 0)
+    {
+      int err;
+      socklen_t len = sizeof(err);
+      if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)
+      {
+        close(sockfd);
+        sockfd = -1;
+        continue;
+      }
+    }
+    else
+    {
+      close(sockfd);
+      sockfd = -1;
+      continue;
+    }
+
+    fcntl(sockfd, F_SETFL, flags); // restore blocking
+
+    char addrStr[INET6_ADDRSTRLEN];
+    void *addrPtr = (p->ai_family == AF_INET)
+                        ? (void *)&((struct sockaddr_in *)p->ai_addr)->sin_addr
+                        : (void *)&((struct sockaddr_in6 *)p->ai_addr)->sin6_addr;
+    inet_ntop(p->ai_family, addrPtr, addrStr, sizeof(addrStr));
+    LOG("Connected to " << addrStr << ":" << port);
+    break;
   }
   freeaddrinfo(res);
 
   if (sockfd < 0)
   {
-    std::cerr << "ERROR: CANT CONNECT TO " << host << std::endl;
+    std::cerr << "ERROR" << std::endl;
     return 1;
   }
 
@@ -136,7 +170,7 @@ int main(int argc, char *argv[])
     std::string line = readLine(sockfd);
     if (line.empty())
     {
-      std::cerr << "ERROR: TIMEOUT OR CONNECTION CLOSED" << std::endl;
+      std::cerr << "ERROR" << std::endl;
       close(sockfd);
       return 1;
     }
@@ -159,7 +193,7 @@ int main(int argc, char *argv[])
   std::string assignment = readLine(sockfd);
   if (assignment.empty())
   {
-    std::cerr << "ERROR: NO OPERATION RECEIVED" << std::endl;
+    std::cerr << "ERROR" << std::endl;
     close(sockfd);
     return 1;
   }
@@ -169,7 +203,7 @@ int main(int argc, char *argv[])
   double v1, v2;
   if (sscanf(assignment.c_str(), "%s %lf %lf", op, &v1, &v2) != 3)
   {
-    std::cerr << "ERROR: INVALID FORMAT" << std::endl;
+    std::cerr << "ERROR" << std::endl;
     close(sockfd);
     return 1;
   }
@@ -208,7 +242,7 @@ int main(int argc, char *argv[])
   }
   else
   {
-    std::cerr << "ERROR: UNKNOWN OPERATION" << std::endl;
+    std::cerr << "ERROR" << std::endl;
     close(sockfd);
     return 1;
   }
@@ -221,24 +255,20 @@ int main(int argc, char *argv[])
 
   std::string trimmedResult = resultBuf;
   trimmedResult.erase(trimmedResult.find_last_not_of("\n\r") + 1);
-
   LOG("Calculated the result to " << trimmedResult);
 
   send(sockfd, resultBuf, strlen(resultBuf), 0);
 
-  // Read server response
   std::string serverReply = readLine(sockfd);
   if (serverReply.empty())
   {
-    std::cerr << "ERROR: NO SERVER RESPONSE" << std::endl;
+    std::cerr << "ERROR" << std::endl;
     close(sockfd);
     return 1;
   }
   serverReply.erase(serverReply.find_last_not_of("\n\r") + 1);
 
-  std::string myres = trimmedResult;
-
-  std::cout << serverReply << " (myresult=" << myres << ")" << std::endl;
+  std::cout << serverReply << " (myresult=" << trimmedResult << ")" << std::endl;
 
   close(sockfd);
   return (serverReply == "OK") ? 0 : 1;
